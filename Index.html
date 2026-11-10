@@ -1,0 +1,345 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QuickInbox - Temporary Mail</title>
+
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  background:#0b1020;color:#f4f6ff;
+  font-family:Arial,sans-serif;padding:20px;
+}
+.container{max-width:750px;margin:auto}
+header{text-align:center;padding:35px 10px}
+.logo{font-size:34px;font-weight:bold;color:#8b9cff}
+header p{color:#9ca8c5;margin-top:10px}
+.card{
+  background:#151e33;border:1px solid #293550;
+  border-radius:15px;padding:20px;margin-bottom:18px;
+}
+h2{font-size:18px;margin-bottom:15px}
+.email{
+  background:#0b1428;border:1px solid #35466a;
+  border-radius:10px;padding:15px;
+  font-size:16px;overflow-wrap:anywhere;
+  margin-bottom:13px;
+}
+button{
+  border:0;border-radius:9px;padding:12px 16px;
+  background:#6579ff;color:white;font-weight:bold;
+  cursor:pointer;margin:4px;
+}
+button:disabled{opacity:.5}
+.secondary{background:#283651}
+.status{color:#9eacd0;font-size:13px;margin-top:12px}
+.mail{
+  background:#0d172b;padding:15px;
+  border-radius:10px;margin-top:10px;
+  border:1px solid #293b5c;cursor:pointer;
+}
+.mail p{color:#9ca8c5;font-size:13px;margin-top:7px}
+#messageBody{
+  white-space:pre-wrap;overflow-wrap:anywhere;
+  line-height:1.6;color:#dce4ff;
+}
+.empty{text-align:center;padding:30px;color:#8998b8}
+footer{text-align:center;color:#8592ad;font-size:12px;padding:25px}
+footer a{color:#9baaff}
+</style>
+</head>
+
+<body>
+<div class="container">
+
+<header>
+  <div class="logo">✉ QuickInbox</div>
+  <p>Simple temporary email inbox</p>
+</header>
+
+<div class="card">
+  <h2>Your temporary email</h2>
+  <div class="email" id="email">Generating email...</div>
+
+  <button id="generate" onclick="generateEmail()">
+    Generate Email
+  </button>
+  <button class="secondary" onclick="copyEmail()">
+    Copy Email
+  </button>
+  <button class="secondary" onclick="deleteEmail()">
+    Delete
+  </button>
+
+  <div class="status" id="status">Connecting...</div>
+</div>
+
+<div class="card">
+  <h2>📥 Inbox</h2>
+  <button id="refresh" onclick="loadInbox()">↻ Refresh Inbox</button>
+  <div id="inbox">
+    <div class="empty">Generate an email to start.</div>
+  </div>
+</div>
+
+<div class="card" id="reader" hidden>
+  <h2 id="subject">Message</h2>
+  <p id="sender" class="status"></p>
+  <hr style="border-color:#293550;margin:15px 0">
+  <div id="messageBody"></div>
+</div>
+
+<footer>
+  Powered by Mail.tm API.
+  <br><br>
+  <a href="https://mail.tm/" target="_blank" rel="noopener">
+    Email service by Mail.tm
+  </a>
+</footer>
+
+</div>
+
+<script>
+const API = "https://api.mail.tm";
+
+let account = null;
+let token = null;
+let timer = null;
+
+const $ = id => document.getElementById(id);
+
+function setStatus(message){
+  $("status").textContent = message;
+}
+
+async function request(path, options={}){
+  const response = await fetch(API + path, {
+    ...options,
+    headers:{
+      ...(options.headers || {}),
+      ...(token ? {Authorization:"Bearer "+token} : {})
+    }
+  });
+
+  if(!response.ok){
+    let error = {};
+    try{error=await response.json()}catch(e){}
+    throw new Error(error.message || "API error: "+response.status);
+  }
+
+  if(response.status === 204) return null;
+  return response.json();
+}
+
+function randomName(){
+  return "inbox"+Math.random().toString(36).slice(2,12);
+}
+
+function randomPassword(){
+  const bytes = new Uint8Array(24);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes,b=>b.toString(16).padStart(2,"0")).join("");
+}
+
+async function generateEmail(){
+  $("generate").disabled=true;
+  setStatus("Creating your temporary email...");
+  $("inbox").innerHTML='<div class="empty">Please wait...</div>';
+
+  try{
+    if(account) await deleteEmail(false);
+
+    const domainsData = await request("/domains");
+    const domains = domainsData["hydra:member"] || [];
+
+    const available = domains.filter(d=>d.isActive && !d.isPrivate);
+
+    if(!available.length) throw new Error("No available email domains.");
+
+    let address, password=randomPassword(), created;
+
+    // Try available domains until one accepts the address.
+    for(const domain of available){
+      address=randomName()+"@"+domain.domain;
+
+      try{
+        created=await request("/accounts",{
+          method:"POST",
+          headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({address,password})
+        });
+        break;
+      }catch(e){
+        if(!/already|exist|invalid|unprocessable/i.test(e.message))
+          throw e;
+      }
+    }
+
+    if(!created) throw new Error("Could not create account. Try later.");
+
+    const login=await request("/token",{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({address,password})
+    });
+
+    account={
+      id:created.id,
+      address:address,
+      password:password
+    };
+
+    token=login.token;
+
+    // Keep credentials only in this browser tab.
+    sessionStorage.setItem("quickinbox",JSON.stringify({
+      account,token
+    }));
+
+    $("email").textContent=address;
+    $("reader").hidden=true;
+    setStatus("Email ready. Waiting for messages.");
+
+    await loadInbox();
+    startAutoRefresh();
+
+  }catch(error){
+    setStatus("Error: "+error.message);
+    $("inbox").innerHTML=
+      '<div class="empty">Could not create inbox. Please try again later.</div>';
+  }finally{
+    $("generate").disabled=false;
+  }
+}
+
+async function copyEmail(){
+  if(!account) return alert("Generate an email first.");
+
+  try{
+    await navigator.clipboard.writeText(account.address);
+    setStatus("Email copied!");
+  }catch(e){
+    setStatus("Copy unavailable. Select the email manually.");
+  }
+}
+
+async function loadInbox(){
+  if(!token) return;
+
+  $("refresh").disabled=true;
+
+  try{
+    const data=await request("/messages");
+    const messages=data["hydra:member"] || [];
+
+    $("inbox").innerHTML="";
+
+    if(messages.length===0){
+      $("inbox").innerHTML=
+        '<div class="empty">📭 No messages yet.<br>Waiting for incoming email...</div>';
+    }
+
+    messages.forEach(message=>{
+      const item=document.createElement("div");
+      item.className="mail";
+
+      const subject=document.createElement("strong");
+      subject.textContent=message.subject || "(No subject)";
+
+      const sender=document.createElement("p");
+      sender.textContent="From: "+(message.from?.address || "Unknown");
+
+      const date=document.createElement("p");
+      date.textContent=new Date(message.createdAt).toLocaleString();
+
+      item.append(subject,sender,date);
+      item.onclick=()=>openMessage(message.id);
+
+      $("inbox").appendChild(item);
+    });
+
+    setStatus("Inbox updated: "+messages.length+" message(s).");
+
+  }catch(error){
+    setStatus("Inbox error: "+error.message);
+  }finally{
+    $("refresh").disabled=false;
+  }
+}
+
+async function openMessage(id){
+  try{
+    const message=await request("/messages/"+encodeURIComponent(id));
+
+    $("reader").hidden=false;
+    $("subject").textContent=message.subject || "(No subject)";
+    $("sender").textContent="From: "+(message.from?.address || "Unknown");
+
+    // Display plain text only. Never inject email HTML into the page.
+    $("messageBody").textContent=
+      message.text || "No plain text content available.";
+
+    window.scrollTo({
+      top:$("reader").offsetTop,
+      behavior:"smooth"
+    });
+
+  }catch(error){
+    setStatus("Could not open message: "+error.message);
+  }
+}
+
+function startAutoRefresh(){
+  clearInterval(timer);
+  timer=setInterval(()=>{
+    if(token) loadInbox();
+  },15000);
+}
+
+async function deleteEmail(showMessage=true){
+  clearInterval(timer);
+
+  if(account && token){
+    try{
+      await request("/accounts/"+encodeURIComponent(account.id),{
+        method:"DELETE"
+      });
+    }catch(e){}
+  }
+
+  account=null;
+  token=null;
+
+  sessionStorage.removeItem("quickinbox");
+
+  $("email").textContent="No active email";
+  $("inbox").innerHTML='<div class="empty">Generate a new email.</div>';
+  $("reader").hidden=true;
+
+  if(showMessage) setStatus("Email deleted.");
+}
+
+function restoreSession(){
+  try{
+    const saved=JSON.parse(sessionStorage.getItem("quickinbox"));
+
+    if(saved?.account && saved?.token){
+      account=saved.account;
+      token=saved.token;
+      $("email").textContent=account.address;
+      setStatus("Restoring your inbox...");
+      loadInbox();
+      startAutoRefresh();
+      return;
+    }
+  }catch(e){}
+
+  setStatus("Ready. Generate an email to begin.");
+}
+
+restoreSession();
+</script>
+</body>
+</html>
